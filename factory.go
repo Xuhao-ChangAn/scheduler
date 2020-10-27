@@ -192,6 +192,7 @@ func (c *Configurator) create() (*Scheduler, error) {
 	)
 	debugger.ListenForSignal(c.StopEverything)
 
+	//实现了kubernetes原生调度接口的调度器
 	algo := core.NewGenericScheduler(
 		c.schedulerCache,
 		podQueue,
@@ -205,10 +206,12 @@ func (c *Configurator) create() (*Scheduler, error) {
 	)
 
 	return &Scheduler{
-		SchedulerCache:  c.schedulerCache,
-		Algorithm:       algo,
-		Profiles:        profiles,
-		NextPod:         internalqueue.MakeNextPodFunc(podQueue),
+		SchedulerCache: c.schedulerCache,
+		Algorithm:      algo,
+		Profiles:       profiles,
+		NextPod:        internalqueue.MakeNextPodFunc(podQueue),
+		//增加下一轮一群调度pod选择
+		NextRoundPod:    internalqueue.MakeNextRoundFunc(podQueue),
 		Error:           MakeDefaultErrorFunc(c.client, podQueue, c.schedulerCache),
 		StopEverything:  c.StopEverything,
 		VolumeBinder:    c.volumeBinder,

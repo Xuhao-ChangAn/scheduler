@@ -103,6 +103,7 @@ func (f *FitError) Error() string {
 // TODO: Rename this type.
 type ScheduleAlgorithm interface {
 	Schedule(context.Context, *profile.Profile, *framework.CycleState, *v1.Pod) (scheduleResult ScheduleResult, err error)
+	FastSchedule(context.Context, *profile.Profile, *framework.CycleState, []*v1.Pod) (scheduleResult *FastScheduleResult, err error)
 	// Preempt receives scheduling errors for a pod and tries to create room for
 	// the pod by preempting lower priority pods if possible.
 	// It returns the node where preemption happened, a list of preempted pods, a
@@ -122,6 +123,11 @@ type ScheduleResult struct {
 	EvaluatedNodes int
 	// Number of feasible nodes on one pod scheduled
 	FeasibleNodes int
+}
+
+type FastScheduleResult struct {
+	SucceededMap map[*v1.Pod]string
+	FailedSlice  []*v1.Pod
 }
 
 type genericScheduler struct {
@@ -224,6 +230,62 @@ func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, 
 		EvaluatedNodes: len(filteredNodes) + len(filteredNodesStatuses),
 		FeasibleNodes:  len(filteredNodes),
 	}, err
+}
+
+func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profile, state *framework.CycleState, pods []*v1.Pod) (result *FastScheduleResult, err error) {
+	failedSlice := make([]*v1.Pod, 0)
+	succeededMap := make(map[*v1.Pod]string, 0)
+	scheduleResult := &FastScheduleResult{
+		SucceededMap: succeededMap,
+		FailedSlice:  failedSlice,
+	}
+	filteredNodes, err := g.nodeInfoSnapshot.NodeInfos().List()
+	//开始使用过滤系插件过滤出每个pod
+	for i := 0; i < len(pods); {
+		trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pods[i].Namespace}, utiltrace.Field{Key: "name", Value: pods[i].Name})
+		defer trace.LogIfLong(100 * time.Millisecond)
+
+		if err := podPassesBasicChecks(pods[i], g.pvcLister); err != nil {
+			return result, err
+		}
+		trace.Step("Basic checks done")
+
+		if err := g.snapshot(); err != nil {
+			return result, err
+		}
+		trace.Step("Snapshotting scheduler cache and node infos done")
+
+		if g.nodeInfoSnapshot.NumNodes() == 0 {
+			return result, ErrNoNodesAvailable
+		}
+
+		// Run "prefilter" plugins.
+		preFilterStatus := prof.RunPreFilterPlugins(ctx, state, pods[i])
+		if !preFilterStatus.IsSuccess() {
+			failedSlice = append(failedSlice, pods[i])
+			pods = append(pods[:i], pods[i+1:]...)
+			continue
+		}
+		trace.Step("Running prefilter plugins done")
+
+		startPredicateEvalTime := time.Now()
+		//TODO 这里会为每个pod过滤出来可以运行的节点，按理来讲，应该每次过滤的时候，都是用上一次过滤出来的节点才对
+		filteredNodesStatuses := make(framework.NodeToStatusMap)
+		filteredNodes, err = g.FastFindNodesThatPassFilters(ctx, prof, state, pods[i], filteredNodesStatuses, filteredNodes)
+		if err != nil {
+			return scheduleResult, err
+		}
+
+		if len(filteredNodes) == 0 {
+			return scheduleResult, nil
+		}
+		metrics.DeprecatedSchedulingAlgorithmPredicateEvaluationSecondsDuration.Observe(metrics.SinceInSeconds(startPredicateEvalTime))
+		metrics.DeprecatedSchedulingDuration.WithLabelValues(metrics.PredicateEvaluation).Observe(metrics.SinceInSeconds(startPredicateEvalTime))
+	}
+
+	//TODO 过滤出来可运行节点之后，就是开始蚁群调度的时候了
+
+	return scheduleResult, nil
 }
 
 func (g *genericScheduler) Extenders() []SchedulerExtender {
@@ -466,6 +528,81 @@ func (g *genericScheduler) findNodesThatPassFilters(ctx context.Context, prof *p
 				atomic.AddInt32(&filteredLen, -1)
 			} else {
 				filtered[length-1] = nodeInfo.Node()
+			}
+		} else {
+			statusesLock.Lock()
+			if !status.IsSuccess() {
+				statuses[nodeInfo.Node().Name] = status
+			}
+			statusesLock.Unlock()
+		}
+	}
+
+	beginCheckNode := time.Now()
+	statusCode := framework.Success
+	defer func() {
+		// We record Filter extension point latency here instead of in framework.go because framework.RunFilterPlugins
+		// function is called for each node, whereas we want to have an overall latency for all nodes per scheduling cycle.
+		// Note that this latency also includes latency for `addNominatedPods`, which calls framework.RunPreFilterAddPod.
+		metrics.FrameworkExtensionPointDuration.WithLabelValues(framework.Filter, statusCode.String()).Observe(metrics.SinceInSeconds(beginCheckNode))
+	}()
+
+	// Stops searching for more nodes once the configured number of feasible nodes
+	// are found.
+	workqueue.ParallelizeUntil(ctx, 16, len(allNodes), checkNode)
+	processedNodes := int(filteredLen) + len(statuses)
+	g.nextStartNodeIndex = (g.nextStartNodeIndex + processedNodes) % len(allNodes)
+
+	filtered = filtered[:filteredLen]
+	if err := errCh.ReceiveError(); err != nil {
+		statusCode = framework.Error
+		return nil, err
+	}
+	return filtered, nil
+}
+
+func (g *genericScheduler) FastFindNodesThatPassFilters(
+	ctx context.Context,
+	prof *profile.Profile,
+	state *framework.CycleState,
+	pod *v1.Pod,
+	statuses framework.NodeToStatusMap,
+	allNodes []*schedulernodeinfo.NodeInfo) ([]*schedulernodeinfo.NodeInfo, error) {
+
+	numNodesToFind := g.numFeasibleNodesToFind(int32(len(allNodes)))
+
+	// Create filtered list with enough space to avoid growing it
+	// and allow assigning.
+	filtered := make([]*schedulernodeinfo.NodeInfo, numNodesToFind)
+
+	if !prof.HasFilterPlugins() {
+		for i := range filtered {
+			filtered[i] = allNodes[i]
+		}
+		g.nextStartNodeIndex = (g.nextStartNodeIndex + len(filtered)) % len(allNodes)
+		return filtered, nil
+	}
+
+	errCh := util.NewErrorChannel()
+	var statusesLock sync.Mutex
+	var filteredLen int32
+	ctx, cancel := context.WithCancel(ctx)
+	checkNode := func(i int) {
+		// We check the nodes starting from where we left off in the previous scheduling cycle,
+		// this is to make sure all nodes have the same chance of being examined across pods.
+		nodeInfo := allNodes[(g.nextStartNodeIndex+i)%len(allNodes)]
+		fits, status, err := g.podPassesFiltersOnNode(ctx, prof, state, pod, nodeInfo)
+		if err != nil {
+			errCh.SendErrorWithCancel(err, cancel)
+			return
+		}
+		if fits {
+			length := atomic.AddInt32(&filteredLen, 1)
+			if length > numNodesToFind {
+				cancel()
+				atomic.AddInt32(&filteredLen, -1)
+			} else {
+				filtered[length-1] = nodeInfo
 			}
 		} else {
 			statusesLock.Lock()

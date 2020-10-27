@@ -77,6 +77,7 @@ type SchedulingQueue interface {
 	// Pop removes the head of the queue and returns it. It blocks if the
 	// queue is empty and waits until a new item is added to the queue.
 	Pop() (*framework.PodInfo, error)
+	PopAll() ([]*framework.PodInfo, error)
 	Update(oldPod, newPod *v1.Pod) error
 	Delete(pod *v1.Pod) error
 	MoveAllToActiveOrBackoffQueue(event string)
@@ -389,6 +390,23 @@ func (p *PriorityQueue) Pop() (*framework.PodInfo, error) {
 	pInfo.Attempts++
 	p.schedulingCycle++
 	return pInfo, err
+}
+
+func (p *PriorityQueue) PopAll() ([]*framework.PodInfo, error) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	result := make([]*framework.PodInfo, 0)
+	for p.activeQ.Len() != 0 {
+		obj, err := p.activeQ.Pop()
+		if err != nil {
+			return nil, err
+		}
+		pInfo := obj.(*framework.PodInfo)
+		result = append(result, pInfo)
+		pInfo.Attempts++
+	}
+	p.schedulingCycle++
+	return result, nil
 }
 
 // isPodUpdated checks if the pod is updated in a way that it may have become
@@ -811,6 +829,18 @@ func MakeNextPodFunc(queue SchedulingQueue) func() *framework.PodInfo {
 			return podInfo
 		}
 		klog.Errorf("Error while retrieving next pod from scheduling queue: %v", err)
+		return nil
+	}
+}
+
+func MakeNextRoundFunc(queue SchedulingQueue) func() []*framework.PodInfo {
+	return func() []*framework.PodInfo {
+		podInfoArray, err := queue.PopAll()
+		if err == nil {
+			klog.V(4).Infof("About to try and schedule with AntScheduler")
+			return podInfoArray
+		}
+		klog.Errorf("Error while retrieving next round pods from scheduling queue: %v", err)
 		return nil
 	}
 }

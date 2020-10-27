@@ -96,6 +96,7 @@ type Scheduler struct {
 	// stale while they sit in a channel.
 	NextPod func() *framework.PodInfo
 
+	NextRoundPod func() []*framework.PodInfo
 	// Error is called if there is an error. It is passed the pod in
 	// question, and the error
 	Error func(*framework.PodInfo, error)
@@ -392,6 +393,18 @@ func (sched *Scheduler) recordSchedulingFailure(prof *profile.Profile, podInfo *
 	}
 }
 
+func (sched *Scheduler) recordFastSchedulingFailure(prof *profile.Profile, pod *v1.Pod, err error, reason string, message string) {
+	prof.Recorder.Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", message)
+	if err := sched.podConditionUpdater.update(pod, &v1.PodCondition{
+		Type:    v1.PodScheduled,
+		Status:  v1.ConditionFalse,
+		Reason:  reason,
+		Message: err.Error(),
+	}); err != nil {
+		klog.Errorf("Error updating the condition of the pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+}
+
 // preempt tries to create room for a pod that has failed to schedule, by preempting lower priority pods if possible.
 // If it succeeds, it adds the name of the node where preemption has happened to the pod spec.
 // It returns the node name and an error if any.
@@ -559,6 +572,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 		return
 	}
 	pod := podInfo.Pod
+	//这里是查看待调度pod是否有指定的调度器
 	prof, err := sched.profileForPod(pod)
 	if err != nil {
 		// This shouldn't happen, because we only accept for scheduling the pods
@@ -749,6 +763,216 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 			prof.RunPostBindPlugins(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
 		}
 	}()
+}
+
+func (sched *Scheduler) scheduleAll(ctx context.Context) {
+	podInfos := sched.NextRoundPod()
+	//如果调度队列为空时，pod可能为空
+	if len(podInfos) == 0 {
+		return
+	}
+
+	prof, ok := sched.Profiles["default-scheduler"]
+	if !ok {
+		klog.Errorf("profile not found for scheduler name----------default-scheduler")
+	}
+
+	//检查一下是否有可以跳过调度的pod，并将pod从podinfo中提出来
+	pods := make([]*v1.Pod, 0)
+	for i := 0; i < len(podInfos); {
+		pod := podInfos[i].Pod
+		if sched.skipPodSchedule(prof, pod) {
+			podInfos = append(podInfos[:i], podInfos[i+1:]...)
+			continue
+		}
+		pods = append(pods, pod)
+		i++
+	}
+	klog.V(3).Infof("Attempting to schedule next round pods with ant scheduler")
+
+	// Synchronously attempt to find a fit for the pod.
+	start := time.Now()
+	state := framework.NewCycleState()
+	state.SetRecordPluginMetrics(rand.Intn(100) < pluginMetricsSamplePercent)
+	schedulingCycleCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	//TODO 重构Schedule接口的实现先过滤出来可用的节点
+	//待调度pod在该实现中，先经过过滤插件的过滤，
+	//succeededResult 是一个pod和node绑定个一个map，key为pod， value为node名
+	//failedPods是一个调度失败的pod切片
+	fastScheduleResult, err := sched.Algorithm.FastSchedule(schedulingCycleCtx, prof, state, pods)
+	if err != nil {
+		klog.V(3).Infof("Fast schedule pods error %v, prepare to start native Schedule algorithm!", err)
+	}
+
+	for pod := range fastScheduleResult.SucceededMap {
+		assumedPod := pod
+		allBound, err := sched.VolumeBinder.AssumePodVolumes(assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+		if err != nil {
+			message := fmt.Sprintf("AssumePodVolumes failed: %v", err)
+			prof.Recorder.Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", message)
+			if err := sched.podConditionUpdater.update(pod, &v1.PodCondition{
+				Type:    v1.PodScheduled,
+				Status:  v1.ConditionFalse,
+				Reason:  SchedulerError,
+				Message: err.Error(),
+			}); err != nil {
+				klog.Errorf("Error updating the condition of the pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			}
+			metrics.PodScheduleErrors.Inc()
+			continue
+		}
+
+		// Run "reserve" plugins.
+		if sts := prof.RunReservePlugins(schedulingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod]); !sts.IsSuccess() {
+			message := sts.AsError().Error()
+			prof.Recorder.Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", message)
+			if err := sched.podConditionUpdater.update(pod, &v1.PodCondition{
+				Type:    v1.PodScheduled,
+				Status:  v1.ConditionFalse,
+				Reason:  SchedulerError,
+				Message: message,
+			}); err != nil {
+				klog.Errorf("Error updating the condition of the pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			}
+			metrics.PodScheduleErrors.Inc()
+			continue
+		}
+
+		// assume modifies `assumedPod` by setting NodeName=scheduleResult.SuggestedHost
+		err = sched.assume(assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+		if err != nil {
+			// This is most probably result of a BUG in retrying logic.
+			// We report an error here so that pod scheduling can be retried.
+			// This relies on the fact that Error will check if the pod has been bound
+			// to a node and if so will not add it back to the unscheduled pods queue
+			// (otherwise this would cause an infinite loop).
+			message := fmt.Sprintf("AssumePod failed: %v", err)
+			prof.Recorder.Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", message)
+			if err := sched.podConditionUpdater.update(pod, &v1.PodCondition{
+				Type:    v1.PodScheduled,
+				Status:  v1.ConditionFalse,
+				Reason:  SchedulerError,
+				Message: err.Error(),
+			}); err != nil {
+				klog.Errorf("Error updating the condition of the pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			}
+			metrics.PodScheduleErrors.Inc()
+			continue
+		}
+
+		// Run "permit" plugins.
+		runPermitStatus := prof.RunPermitPlugins(schedulingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+		if runPermitStatus.Code() != framework.Wait && !runPermitStatus.IsSuccess() {
+			var reason string
+			if runPermitStatus.IsUnschedulable() {
+				metrics.PodScheduleFailures.Inc()
+				reason = v1.PodReasonUnschedulable
+			} else {
+				metrics.PodScheduleErrors.Inc()
+				reason = SchedulerError
+			}
+			if forgetErr := sched.Cache().ForgetPod(assumedPod); forgetErr != nil {
+				klog.Errorf("scheduler cache ForgetPod failed: %v", forgetErr)
+			}
+			// One of the plugins returned status different than success or wait.
+			prof.RunUnreservePlugins(schedulingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+			err = runPermitStatus.AsError()
+			message := runPermitStatus.Message()
+			prof.Recorder.Eventf(pod, nil, v1.EventTypeWarning, reason, "Scheduling", message)
+			if err := sched.podConditionUpdater.update(pod, &v1.PodCondition{
+				Type:    v1.PodScheduled,
+				Status:  v1.ConditionFalse,
+				Reason:  SchedulerError,
+				Message: err.Error(),
+			}); err != nil {
+				klog.Errorf("Error updating the condition of the pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			}
+			metrics.PodScheduleErrors.Inc()
+			continue
+		}
+
+		go func() {
+			bindingCycleCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			metrics.SchedulerGoroutines.WithLabelValues("binding").Inc()
+			defer metrics.SchedulerGoroutines.WithLabelValues("binding").Dec()
+
+			waitOnPermitStatus := prof.WaitOnPermit(bindingCycleCtx, assumedPod)
+			if !waitOnPermitStatus.IsSuccess() {
+				var reason string
+				if waitOnPermitStatus.IsUnschedulable() {
+					metrics.PodScheduleFailures.Inc()
+					reason = v1.PodReasonUnschedulable
+				} else {
+					metrics.PodScheduleErrors.Inc()
+					reason = SchedulerError
+				}
+				if forgetErr := sched.Cache().ForgetPod(assumedPod); forgetErr != nil {
+					klog.Errorf("scheduler cache ForgetPod failed: %v", forgetErr)
+				}
+				// trigger un-reserve plugins to clean up state associated with the reserved Pod
+				prof.RunUnreservePlugins(bindingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+				sched.recordFastSchedulingFailure(prof, assumedPod, waitOnPermitStatus.AsError(), reason, waitOnPermitStatus.Message())
+				return
+			}
+
+			// Bind volumes first before Pod
+			if !allBound {
+				err := sched.bindVolumes(assumedPod)
+				if err != nil {
+					sched.recordFastSchedulingFailure(prof, assumedPod, err, "VolumeBindingFailed", err.Error())
+					metrics.PodScheduleErrors.Inc()
+					// trigger un-reserve plugins to clean up state associated with the reserved Pod
+					prof.RunUnreservePlugins(bindingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+					return
+				}
+			}
+
+			// Run "prebind" plugins.
+			preBindStatus := prof.RunPreBindPlugins(bindingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+			if !preBindStatus.IsSuccess() {
+				var reason string
+				metrics.PodScheduleErrors.Inc()
+				reason = SchedulerError
+				if forgetErr := sched.Cache().ForgetPod(assumedPod); forgetErr != nil {
+					klog.Errorf("scheduler cache ForgetPod failed: %v", forgetErr)
+				}
+				// trigger un-reserve plugins to clean up state associated with the reserved Pod
+				prof.RunUnreservePlugins(bindingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+				sched.recordFastSchedulingFailure(prof, assumedPod, preBindStatus.AsError(), reason, preBindStatus.Message())
+				return
+			}
+
+			err := sched.bind(bindingCycleCtx, prof, assumedPod, fastScheduleResult.SucceededMap[assumedPod], state)
+			metrics.E2eSchedulingLatency.Observe(metrics.SinceInSeconds(start))
+			if err != nil {
+				metrics.PodScheduleErrors.Inc()
+				// trigger un-reserve plugins to clean up state associated with the reserved Pod
+				prof.RunUnreservePlugins(bindingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+				sched.recordFastSchedulingFailure(prof, assumedPod, err, SchedulerError, fmt.Sprintf("Binding rejected: %v", err))
+			} else {
+				// Calculating nodeResourceString can be heavy. Avoid it if klog verbosity is below 2.
+				if klog.V(2) {
+					klog.Infof("pod %v/%v is bound successfully on node %q", assumedPod.Namespace, assumedPod.Name, fastScheduleResult.SucceededMap[assumedPod])
+				}
+
+				metrics.PodScheduleSuccesses.Inc()
+				//TODO 这里还需要考虑一下，毕竟每次调度失败的都要重新进入队列进行等待，要将调度尝试次数指标记录下来
+				//metrics.PodSchedulingAttempts.Observe(float64(podInfo.Attempts))
+				//metrics.PodSchedulingDuration.Observe(metrics.SinceInSeconds(podInfo.InitialAttemptTimestamp))
+
+				// Run "postbind" plugins.
+				prof.RunPostBindPlugins(bindingCycleCtx, state, assumedPod, fastScheduleResult.SucceededMap[assumedPod])
+			}
+		}()
+	}
+
+	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
+
+	//TODO 将调度失败的节点用原生的调度算法方式进行调度
+
 }
 
 func (sched *Scheduler) profileForPod(pod *v1.Pod) (*profile.Profile, error) {
