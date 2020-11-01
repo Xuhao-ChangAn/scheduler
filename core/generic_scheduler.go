@@ -283,7 +283,7 @@ func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profi
 		metrics.DeprecatedSchedulingDuration.WithLabelValues(metrics.PredicateEvaluation).Observe(metrics.SinceInSeconds(startPredicateEvalTime))
 	}
 
-	//TODO 过滤出来可运行节点之后，就是开始蚁群调度的时候了
+	//TODO 过滤出来可运行节点之后，就是开始蚁群调度的时候了，将pods数组和node数组作为输入即可
 
 	return scheduleResult, nil
 }
