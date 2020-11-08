@@ -15,12 +15,12 @@ type AntScheduler struct {
 	PodArray            []*v1.Pod
 	availableNodeArray  []*v1.Node
 	pheromoneMatrix     [][]float64
-	maxPheromoneMap     []int
+	MaxPheromoneMap     []int
 	unscheduledPods     map[int]int
 	criticalPointMatrix []int //在一次迭代中，随机分配策略的蚂蚁临界编号
+
 	iteratorNum         int
 	antNum              int
-
 	pheromoneDecayRatio float64
 	pheromoneRaiseRatio float64
 }
@@ -38,28 +38,28 @@ func New(nodeArray []*nodeinfo.NodeInfo, pods []*v1.Pod) *AntScheduler {
 	}
 }
 
-//TODO 可以考虑定义函数类型
-func (ant *AntScheduler) withDecayRatio(decay float64) *AntScheduler {
+//TODO 可以考虑定义函数类型，并使用设计模式来优化调用
+func (ant *AntScheduler) WithDecayRatio(decay float64) *AntScheduler {
 	ant.pheromoneDecayRatio = decay
 	return ant
 }
 
-func (ant *AntScheduler) withRaiseRatio(raise float64) *AntScheduler {
+func (ant *AntScheduler) WithRaiseRatio(raise float64) *AntScheduler {
 	ant.pheromoneRaiseRatio = raise
 	return ant
 }
 
-func (ant *AntScheduler) withIteratorNum(it int) *AntScheduler {
+func (ant *AntScheduler) WithIteratorNum(it int) *AntScheduler {
 	ant.iteratorNum = it
 	return ant
 }
 
-func (ant *AntScheduler) withAntNum(antNum int) *AntScheduler {
+func (ant *AntScheduler) WithAntNum(antNum int) *AntScheduler {
 	ant.antNum = antNum
 	return ant
 }
 
-func (ant *AntScheduler) initPheromoneMatrix() *AntScheduler {
+func (ant *AntScheduler) InitPheromoneMatrix() *AntScheduler {
 	pm := make([][]float64, len(ant.PodArray))
 	for i := 0; i < len(ant.PodArray); i++ {
 		pm[i] = make([]float64, len(ant.NodeArray))
@@ -88,7 +88,7 @@ func (ant *AntScheduler) assignOnePod(antCount int, podCount int) int {
 
 	if antCount <= ant.criticalPointMatrix[podCount] {
 		//当前蚂蚁在临界编号之前，因此根据信息素浓度最大的挑选node
-		nodeIndex := ant.maxPheromoneMap[podCount]
+		nodeIndex := ant.MaxPheromoneMap[podCount]
 		node := &ant.availableNodeArray[nodeIndex]
 		//计算node的资源
 		nodeCpu := (*node).Status.Capacity.Cpu().Value()
@@ -166,14 +166,15 @@ func (ant *AntScheduler) updatePheromoneMatrix(minPathOneAnt []int) {
 			maxPheromone = ant.pheromoneMatrix[podIndex][maxIndex]
 		}
 
-		ant.maxPheromoneMap[podIndex] = maxIndex
+		//每次更新信息素矩阵后，也要更新pod对应最大的信息素下标，这个就是最后调度的结果
+		ant.MaxPheromoneMap[podIndex] = maxIndex
 
 		ant.criticalPointMatrix[podIndex] = int(math.Round(float64(ant.antNum) * (maxPheromone / sumPheromone)))
 	}
 
 }
 
-func (ant *AntScheduler) acaSearch() {
+func (ant *AntScheduler) AcaSearch() *AntScheduler {
 	for itCount := 0; itCount < ant.iteratorNum; itCount++ {
 
 		minNodeNum := 10000
@@ -189,7 +190,7 @@ func (ant *AntScheduler) acaSearch() {
 				nodeCount := ant.assignOnePod(antCount, podCount)
 				if nodeCount >= 0 {
 					pathOneAnt[podCount] = nodeCount
-					//TODO 这里是要更新可获取节点的cpu和内存值的，需要对Node对象做修改的
+					// 这里是要更新可获取节点的cpu和内存值的，需要对Node对象做修改的
 					node := ant.availableNodeArray[nodeCount]
 					//需要从node中把调度的pod的cpu和内存数减掉
 					var podCpu int64
@@ -207,6 +208,8 @@ func (ant *AntScheduler) acaSearch() {
 					nodeMem := (*node).Status.Capacity.Memory().Value()
 					nodeCpu = nodeCpu - podCpu
 					nodeMem = nodeMem - podMem
+					node.Status.Capacity.Cpu().Set(nodeCpu)
+					node.Status.Capacity.Memory().Set(nodeMem)
 				} else {
 					ant.unscheduledPods[podCount] = -1
 					pathOneAnt[podCount] = -1 // -1表示没有调度该pod
@@ -233,6 +236,7 @@ func (ant *AntScheduler) acaSearch() {
 
 		ant.updatePheromoneMatrix(minPathOneAnt)
 	}
+	return ant
 }
 
 func (ant *AntScheduler) resetAvailableNodeArray() {

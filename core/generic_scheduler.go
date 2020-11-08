@@ -19,6 +19,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/ant_schedule"
 	"math"
 	"math/rand"
 	"sort"
@@ -236,8 +237,8 @@ func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profi
 	failedSlice := make([]*v1.Pod, 0)
 	succeededMap := make(map[*v1.Pod]string, 0)
 	scheduleResult := &FastScheduleResult{
-		SucceededMap: succeededMap,
-		FailedSlice:  failedSlice,
+		SucceededMap: nil,
+		FailedSlice:  nil,
 	}
 	filteredNodes, err := g.nodeInfoSnapshot.NodeInfos().List()
 	//开始使用过滤系插件过滤出每个pod
@@ -269,7 +270,7 @@ func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profi
 		trace.Step("Running prefilter plugins done")
 
 		startPredicateEvalTime := time.Now()
-		//TODO 这里会为每个pod过滤出来可以运行的节点，按理来讲，应该每次过滤的时候，都是用上一次过滤出来的节点才对
+		// 这里会为每个pod过滤出来可以运行的节点，应该每次过滤的时候，都是用上一次过滤出来的节点才对
 		filteredNodesStatuses := make(framework.NodeToStatusMap)
 		filteredNodes, err = g.FastFindNodesThatPassFilters(ctx, prof, state, pods[i], filteredNodesStatuses, filteredNodes)
 		if err != nil {
@@ -283,8 +284,20 @@ func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profi
 		metrics.DeprecatedSchedulingDuration.WithLabelValues(metrics.PredicateEvaluation).Observe(metrics.SinceInSeconds(startPredicateEvalTime))
 	}
 
-	//TODO 过滤出来可运行节点之后，就是开始蚁群调度的时候了，将pods数组和node数组作为输入即可
-
+	// 过滤出来可运行节点之后，就是开始蚁群调度的时候了，将pods数组和node数组作为输入即可
+	ant := ant_schedule.New(filteredNodes, pods)
+	ant = ant.WithDecayRatio(0.5).
+		WithRaiseRatio(2.0).
+		WithAntNum(100).
+		WithIteratorNum(10).
+		InitPheromoneMatrix().
+		AcaSearch()
+	//搜索结束，这是更新信息素矩阵完成，并且结果就在maxPheromoneMap中，下标为podIndex，value为nodeIndex，晚上successMap即可
+	for index, pod := range pods {
+		succeededMap[pod] = filteredNodes[ant.MaxPheromoneMap[index]].Node().Name
+	}
+	scheduleResult.SucceededMap = succeededMap
+	scheduleResult.FailedSlice = failedSlice
 	return scheduleResult, nil
 }
 

@@ -372,7 +372,7 @@ func (sched *Scheduler) Run(ctx context.Context) {
 		return
 	}
 	sched.SchedulingQueue.Run()
-	wait.UntilWithContext(ctx, sched.scheduleOne, 0)
+	wait.UntilWithContext(ctx, sched.scheduleAll, 0)
 	sched.SchedulingQueue.Close()
 }
 
