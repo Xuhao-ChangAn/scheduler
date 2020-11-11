@@ -797,13 +797,22 @@ func (sched *Scheduler) scheduleAll(ctx context.Context) {
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	//TODO 重构Schedule接口的实现先过滤出来可用的节点
 	//待调度pod在该实现中，先经过过滤插件的过滤，
 	//succeededResult 是一个pod和node绑定个一个map，key为pod， value为node名
 	//failedPods是一个调度失败的pod切片
 	fastScheduleResult, err := sched.Algorithm.FastSchedule(schedulingCycleCtx, prof, state, pods)
 	if err != nil {
-		klog.V(3).Infof("Fast schedule pods error %v, prepare to start native Schedule algorithm!", err)
+		klog.Infof("Fast schedule pods error %v, prepare to start native Schedule algorithm!", err)
+		if fastScheduleResult.SucceededMap == nil {
+			for _, pod := range fastScheduleResult.FailedSlice {
+				//将调度失败的pod重新加入调度队列中
+				addError := sched.SchedulingQueue.Add(pod)
+				if addError != nil {
+					klog.Infof("Fast schedule failed, add pod to the active queue failed!")
+				}
+				sched.scheduleOne(ctx)
+			}
+		}
 	}
 
 	for pod := range fastScheduleResult.SucceededMap {

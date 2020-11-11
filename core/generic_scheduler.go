@@ -234,6 +234,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, 
 }
 
 func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profile, state *framework.CycleState, pods []*v1.Pod) (result *FastScheduleResult, err error) {
+	klog.Infof("Start to fast schedule ******************************")
 	failedSlice := make([]*v1.Pod, 0)
 	succeededMap := make(map[*v1.Pod]string, 0)
 	scheduleResult := &FastScheduleResult{
@@ -241,6 +242,22 @@ func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profi
 		FailedSlice:  nil,
 	}
 	filteredNodes, err := g.nodeInfoSnapshot.NodeInfos().List()
+	if err != nil {
+		scheduleResult.FailedSlice = append(scheduleResult.FailedSlice, pods...)
+		klog.Infof("List nodes from apiServer failed **************************")
+		return scheduleResult, err
+	}
+
+	if len(filteredNodes) == 0 {
+		klog.Infof("The length of nodes listed from apiServer is 0, back to schedule queue and schedule one")
+		scheduleResult.FailedSlice = append(scheduleResult.FailedSlice, pods...)
+		return scheduleResult, &FitError{
+			Pod:                   nil,
+			NumAllNodes:           g.nodeInfoSnapshot.NumNodes(),
+			FilteredNodesStatuses: nil,
+		}
+	}
+
 	//开始使用过滤系插件过滤出每个pod
 	for i := 0; i < len(pods); {
 		trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pods[i].Namespace}, utiltrace.Field{Key: "name", Value: pods[i].Name})
