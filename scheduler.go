@@ -372,7 +372,7 @@ func (sched *Scheduler) Run(ctx context.Context) {
 		return
 	}
 	sched.SchedulingQueue.Run()
-	wait.UntilWithContext(ctx, sched.scheduleAll, 0)
+	wait.UntilWithContext(ctx, sched.scheduleAll, 5)
 	sched.SchedulingQueue.Close()
 }
 
@@ -812,6 +812,7 @@ func (sched *Scheduler) scheduleAll(ctx context.Context) {
 				}
 				sched.scheduleOne(ctx)
 			}
+			return
 		}
 	}
 
@@ -979,9 +980,6 @@ func (sched *Scheduler) scheduleAll(ctx context.Context) {
 	}
 
 	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
-
-	//TODO 将调度失败的节点用原生的调度算法方式进行调度
-
 }
 
 func (sched *Scheduler) profileForPod(pod *v1.Pod) (*profile.Profile, error) {

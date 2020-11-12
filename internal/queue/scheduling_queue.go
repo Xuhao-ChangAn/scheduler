@@ -396,6 +396,15 @@ func (p *PriorityQueue) PopAll() ([]*framework.PodInfo, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	result := make([]*framework.PodInfo, 0)
+	for p.activeQ.Len() == 0 {
+		// When the queue is empty, invocation of Pop() is blocked until new item is enqueued.
+		// When Close() is called, the p.closed is set and the condition is broadcast,
+		// which causes this loop to continue and return from the Pop().
+		if p.closed {
+			return nil, fmt.Errorf(queueClosed)
+		}
+		p.cond.Wait()
+	}
 	for p.activeQ.Len() != 0 {
 		obj, err := p.activeQ.Pop()
 		if err != nil {
