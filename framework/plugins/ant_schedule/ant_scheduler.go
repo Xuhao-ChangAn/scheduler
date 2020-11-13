@@ -31,10 +31,12 @@ func New(nodeArray []*nodeinfo.NodeInfo, pods []*v1.Pod) *AntScheduler {
 		availableNodes[i] = nodeArray[i].Node()
 	}
 	return &AntScheduler{
-		NodeArray:          availableNodes,
-		PodArray:           pods,
-		availableNodeArray: availableNodes,
-		unscheduledPods:    make(map[int]int),
+		NodeArray:           availableNodes,
+		PodArray:            pods,
+		availableNodeArray:  availableNodes,
+		unscheduledPods:     make(map[int]int),
+		criticalPointMatrix: make([]int, len(nodeArray)),
+		MaxPheromoneMap:     make([]int, len(nodeArray)),
 	}
 }
 
@@ -179,7 +181,6 @@ func (ant *AntScheduler) AcaSearch() *AntScheduler {
 
 		minNodeNum := 10000
 		var minPathOneAnt []int
-
 		for antCount := 0; antCount < ant.antNum; antCount++ {
 			ant.resetAvailableNodeArray()                // 重置可用资源数组
 			pathOneAnt := make([]int, len(ant.PodArray)) // 重置当前蚂蚁的路径

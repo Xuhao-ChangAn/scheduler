@@ -234,6 +234,13 @@ func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, 
 }
 
 func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profile, state *framework.CycleState, pods []*v1.Pod) (result *FastScheduleResult, err error) {
+	if err := g.snapshot(); err != nil {
+		return result, err
+	}
+	if g.nodeInfoSnapshot.NumNodes() == 0 {
+		return result, ErrNoNodesAvailable
+	}
+
 	klog.Infof("Start to fast schedule ******************************")
 	failedSlice := make([]*v1.Pod, 0)
 	succeededMap := make(map[*v1.Pod]string, 0)
@@ -299,6 +306,7 @@ func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profi
 		}
 		metrics.DeprecatedSchedulingAlgorithmPredicateEvaluationSecondsDuration.Observe(metrics.SinceInSeconds(startPredicateEvalTime))
 		metrics.DeprecatedSchedulingDuration.WithLabelValues(metrics.PredicateEvaluation).Observe(metrics.SinceInSeconds(startPredicateEvalTime))
+		i++
 	}
 
 	// 过滤出来可运行节点之后，就是开始蚁群调度的时候了，将pods数组和node数组作为输入即可

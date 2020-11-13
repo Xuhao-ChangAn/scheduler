@@ -372,7 +372,7 @@ func (sched *Scheduler) Run(ctx context.Context) {
 		return
 	}
 	sched.SchedulingQueue.Run()
-	wait.UntilWithContext(ctx, sched.scheduleAll, 5)
+	wait.UntilWithContext(ctx, sched.scheduleAll, 0)
 	sched.SchedulingQueue.Close()
 }
 
@@ -768,7 +768,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 func (sched *Scheduler) scheduleAll(ctx context.Context) {
 	podInfos := sched.NextRoundPod()
 	//如果调度队列为空时，pod可能为空
-	if len(podInfos) == 0 {
+	if podInfos == nil || len(podInfos) == 0 {
 		return
 	}
 
@@ -781,6 +781,7 @@ func (sched *Scheduler) scheduleAll(ctx context.Context) {
 	pods := make([]*v1.Pod, 0)
 	for i := 0; i < len(podInfos); {
 		pod := podInfos[i].Pod
+		klog.Infof("Prepare to schedule %v **************", pod.Spec.Containers[0].Name)
 		if sched.skipPodSchedule(prof, pod) {
 			podInfos = append(podInfos[:i], podInfos[i+1:]...)
 			continue
