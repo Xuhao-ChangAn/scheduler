@@ -4,6 +4,7 @@ import (
 	"fmt"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	"k8s.io/kubernetes/pkg/scheduler/nodeinfo"
 	"math"
 )
@@ -11,9 +12,9 @@ import (
 const AntSchedulerName = "AntSchedule"
 
 type AntScheduler struct {
-	NodeArray           []*v1.Node
+	NodeArray           []*nodeinfo.NodeInfo
 	PodArray            []*v1.Pod
-	availableNodeArray  []*v1.Node
+	availableNodeArray  []*nodeinfo.NodeInfo
 	pheromoneMatrix     [][]float64
 	MaxPheromoneMap     []int
 	unscheduledPods     map[int]int
@@ -26,21 +27,20 @@ type AntScheduler struct {
 }
 
 func New(nodeArray []*nodeinfo.NodeInfo, pods []*v1.Pod) *AntScheduler {
-	availableNodes := make([]*v1.Node, len(nodeArray))
-	for i := 0; i < len(nodeArray); i++ {
-		availableNodes[i] = nodeArray[i].Node()
-	}
+	//availableNodes := make([]*v1.Node, len(nodeArray))
+	//for i := 0; i < len(nodeArray); i++ {
+	//	availableNodes[i] = nodeArray[i].Node()
+	//}
 	return &AntScheduler{
-		NodeArray:           availableNodes,
+		NodeArray:           nodeArray,
 		PodArray:            pods,
-		availableNodeArray:  availableNodes,
+		availableNodeArray:  nodeArray,
 		unscheduledPods:     make(map[int]int),
 		criticalPointMatrix: make([]int, len(nodeArray)),
 		MaxPheromoneMap:     make([]int, len(nodeArray)),
 	}
 }
 
-//TODO 可以考虑定义函数类型，并使用设计模式来优化调用
 func (ant *AntScheduler) WithDecayRatio(decay float64) *AntScheduler {
 	ant.pheromoneDecayRatio = decay
 	return ant
@@ -76,40 +76,36 @@ func (ant *AntScheduler) InitPheromoneMatrix() *AntScheduler {
 func (ant *AntScheduler) assignOnePod(antCount int, podCount int) int {
 	pod := ant.PodArray[podCount]
 	//计算当前pod的资源需求
-	//TODO 需要对返回的Resource类型做一定的解析
 	var podCpu int64
-	for _, container := range pod.Spec.Containers {
-		containerCpu := container.Resources.Requests.Cpu().Value()
-		podCpu += containerCpu
-	}
+	podCpu = noderesources.CalculatePodResourceRequest(pod, v1.ResourceCPU)
+	//for _, container := range pod.Spec.Containers {
+	//	containerCpu := container.Resources.Requests.Cpu().MilliValue()
+	//	podCpu += containerCpu
+	//}
 	var podMem int64
-	for _, container := range pod.Spec.Containers {
-		containerMem := container.Resources.Requests.Memory().Value()
-		podMem += containerMem
-	}
+	podMem = noderesources.CalculatePodResourceRequest(pod, v1.ResourceMemory)
+	//for _, container := range pod.Spec.Containers {
+	//	containerMem := container.Resources.Requests.Memory().Value()
+	//	podMem += containerMem
+	//}
+	nodeIndex := ant.MaxPheromoneMap[podCount]
+	node := ant.availableNodeArray[nodeIndex]
+	//计算node的资源
+	nodeCpu := node.AllocatableResource().MilliCPU
+	nodeMem := node.AllocatableResource().Memory
 
 	if antCount <= ant.criticalPointMatrix[podCount] {
 		//当前蚂蚁在临界编号之前，因此根据信息素浓度最大的挑选node
-		nodeIndex := ant.MaxPheromoneMap[podCount]
-		node := &ant.availableNodeArray[nodeIndex]
-		//计算node的资源
-		nodeCpu := (*node).Status.Capacity.Cpu().Value()
-		nodeMem := (*node).Status.Capacity.Memory().Value()
-
 		if nodeCpu >= podCpu && nodeMem >= podMem {
 			return nodeIndex
 		}
 	}
 
-	nodeIndex := rand.Intn(len(ant.NodeArray))
-	node := &ant.availableNodeArray[nodeIndex]
-	nodeCpu := (*node).Status.Capacity.Cpu().Value()
-	nodeMem := (*node).Status.Capacity.Memory().Value()
 	retryCount := 0
 	// 随机重试3次
 	for retryCount < 3 && (podCpu > nodeCpu || podMem > nodeMem) {
 		nodeIndex := rand.Intn(len(ant.NodeArray))
-		node = &ant.availableNodeArray[nodeIndex]
+		node = ant.availableNodeArray[nodeIndex]
 
 		if podCpu <= nodeCpu && podMem <= nodeMem {
 			return nodeIndex
@@ -119,7 +115,7 @@ func (ant *AntScheduler) assignOnePod(antCount int, podCount int) int {
 	}
 
 	for i := 0; i < len(ant.NodeArray); i++ {
-		node = &ant.availableNodeArray[i]
+		node = ant.availableNodeArray[i]
 
 		if podCpu <= nodeCpu && podMem <= nodeMem {
 			return i
@@ -192,25 +188,22 @@ func (ant *AntScheduler) AcaSearch() *AntScheduler {
 				if nodeCount >= 0 {
 					pathOneAnt[podCount] = nodeCount
 					// 这里是要更新可获取节点的cpu和内存值的，需要对Node对象做修改的
-					node := ant.availableNodeArray[nodeCount]
+					node := *ant.availableNodeArray[nodeCount]
 					//需要从node中把调度的pod的cpu和内存数减掉
 					var podCpu int64
-					for _, podContainer := range ant.PodArray[podCount].Spec.Containers {
-						containerCpu := podContainer.Resources.Requests.Cpu().Value()
-						podCpu += containerCpu
-					}
+					podCpu = noderesources.CalculatePodResourceRequest(ant.PodArray[podCount], v1.ResourceCPU)
 					var podMem int64
-					for _, podContainer := range ant.PodArray[podCount].Spec.Containers {
-						containerMem := podContainer.Resources.Requests.Memory().Value()
-						podMem += containerMem
-					}
+					podMem = noderesources.CalculatePodResourceRequest(ant.PodArray[podCount], v1.ResourceMemory)
 
-					nodeCpu := (*node).Status.Capacity.Cpu().Value()
-					nodeMem := (*node).Status.Capacity.Memory().Value()
+					//更新本地缓存node的内存cpu信息
+					nodeCpu := node.AllocatableResource().MilliCPU
+					nodeMem := node.AllocatableResource().Memory
 					nodeCpu = nodeCpu - podCpu
 					nodeMem = nodeMem - podMem
-					node.Status.Capacity.Cpu().Set(nodeCpu)
-					node.Status.Capacity.Memory().Set(nodeMem)
+					node.SetAllocatableResource(&nodeinfo.Resource{
+						MilliCPU: nodeCpu,
+						Memory:   nodeMem,
+					})
 				} else {
 					ant.unscheduledPods[podCount] = -1
 					pathOneAnt[podCount] = -1 // -1表示没有调度该pod

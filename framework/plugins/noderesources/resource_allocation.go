@@ -93,7 +93,7 @@ func (r *resourceAllocationScorer) score(
 func calculateResourceAllocatableRequest(nodeInfo *schedulernodeinfo.NodeInfo, pod *v1.Pod, resource v1.ResourceName) (int64, int64) {
 	allocatable := nodeInfo.AllocatableResource()
 	requested := nodeInfo.RequestedResource()
-	podRequest := calculatePodResourceRequest(pod, resource)
+	podRequest := CalculatePodResourceRequest(pod, resource)
 	switch resource {
 	case v1.ResourceCPU:
 		return allocatable.MilliCPU, (nodeInfo.NonZeroRequest().MilliCPU + podRequest)
@@ -118,7 +118,7 @@ func calculateResourceAllocatableRequest(nodeInfo *schedulernodeinfo.NodeInfo, p
 // calculatePodResourceRequest returns the total non-zero requests. If Overhead is defined for the pod and the
 // PodOverhead feature is enabled, the Overhead is added to the result.
 // podResourceRequest = max(sum(podSpec.Containers), podSpec.InitContainers) + overHead
-func calculatePodResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
+func CalculatePodResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 	var podRequest int64
 	for i := range pod.Spec.Containers {
 		container := &pod.Spec.Containers[i]
