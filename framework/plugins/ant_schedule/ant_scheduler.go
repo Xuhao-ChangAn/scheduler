@@ -1,7 +1,6 @@
 package ant_schedule
 
 import (
-	"fmt"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
@@ -225,8 +224,6 @@ func (ant *AntScheduler) AcaSearch() *AntScheduler {
 				}
 			}
 		}
-
-		fmt.Println("第", itCount+1, "轮最小机器数:", minNodeNum)
 
 		ant.updatePheromoneMatrix(minPathOneAnt)
 	}

@@ -566,6 +566,7 @@ func (sched *Scheduler) finishBinding(prof *profile.Profile, assumed *v1.Pod, ta
 // scheduleOne does the entire scheduling workflow for a single pod.  It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) scheduleOne(ctx context.Context) {
 	//没有新的pod增加事件到来时，会发生阻塞
+	startTime := time.Now()
 	podInfo := sched.NextPod()
 	// pod could be nil when schedulerQueue is closed
 	if podInfo == nil || podInfo.Pod == nil {
@@ -764,9 +765,13 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 			prof.RunPostBindPlugins(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
 		}
 	}()
+	scheduleOneCost := time.Since(startTime)
+	klog.Infof("Schedule one pod cost time %v", scheduleOneCost)
 }
 
 func (sched *Scheduler) scheduleAll(ctx context.Context) {
+	//TODO mark this place schedule start time.
+	startTime := time.Now()
 	podInfos := sched.NextRoundPod()
 	//如果调度队列为空时，pod可能为空
 	if podInfos == nil || len(podInfos) == 0 {
@@ -782,7 +787,6 @@ func (sched *Scheduler) scheduleAll(ctx context.Context) {
 	pods := make([]*v1.Pod, 0)
 	for i := 0; i < len(podInfos); {
 		pod := podInfos[i].Pod
-		klog.Infof("Prepare to schedule %v **************", pod.Spec.Containers[0].Name)
 		if sched.skipPodSchedule(prof, pod) {
 			podInfos = append(podInfos[:i], podInfos[i+1:]...)
 			continue
@@ -979,7 +983,9 @@ func (sched *Scheduler) scheduleAll(ctx context.Context) {
 			}
 		}()
 	}
-
+	//TODO mark this place schedule end time.
+	scheduleTimeCost := time.Since(startTime)
+	klog.Infof("Fast schedule cost %v", scheduleTimeCost)
 	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
 }
 

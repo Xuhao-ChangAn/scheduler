@@ -240,8 +240,6 @@ func (g *genericScheduler) FastSchedule(ctx context.Context, prof *profile.Profi
 	if g.nodeInfoSnapshot.NumNodes() == 0 {
 		return result, ErrNoNodesAvailable
 	}
-
-	klog.Infof("Start to fast schedule ******************************")
 	failedSlice := make([]*v1.Pod, 0)
 	succeededMap := make(map[*v1.Pod]string, 0)
 	scheduleResult := &FastScheduleResult{
