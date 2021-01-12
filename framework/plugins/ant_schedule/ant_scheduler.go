@@ -35,8 +35,8 @@ func New(nodeArray []*nodeinfo.NodeInfo, pods []*v1.Pod) *AntScheduler {
 		PodArray:            pods,
 		availableNodeArray:  nodeArray,
 		unscheduledPods:     make(map[int]int),
-		criticalPointMatrix: make([]int, len(nodeArray)),
-		MaxPheromoneMap:     make([]int, len(nodeArray)),
+		criticalPointMatrix: make([]int, len(pods)),
+		MaxPheromoneMap:     make([]int, len(pods)),
 	}
 }
 
